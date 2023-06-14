@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "server.h"
+#include <cstddef>
 #include <kj/test.h>
 #include <workerd/util/capnp-mock.h>
 #include <workerd/jsg/setup.h>
@@ -102,9 +103,27 @@ public:
     if (actual == nullptr) {
       KJ_FAIL_EXPECT_AT(loc, "message never received");
     } else {
-      std::regex target(matcher.cStr());
+      std::regex target(matcher.cStr(), std::regex::extended);
       KJ_EXPECT(std::regex_match(actual.cStr(), target), actual, matcher, loc);
     }
+  }
+
+  void recvWebSocket(kj::StringPtr expected, kj::SourceLocation loc = {}) {
+    auto actual = readWebSocketMessage();
+    KJ_EXPECT_AT(actual == expected, loc);
+  }
+
+  void recvWebSocketRegex(kj::StringPtr matcher, kj::SourceLocation loc = {}) {
+    auto actual = readWebSocketMessage();
+    std::regex target(matcher.cStr());
+    KJ_EXPECT(std::regex_match(actual.cStr(), target), actual, matcher, loc);
+  }
+
+  void recvWebSocketClose(int expectedCode) {
+    auto actual = readWebSocketMessage();
+    KJ_EXPECT(actual.size() >= 2);
+    int gotCode = (static_cast<uint8_t>(actual[0]) << 8) + static_cast<uint8_t>(actual[1]);
+    KJ_EXPECT(gotCode == expectedCode);
   }
 
   void sendHttpGet(kj::StringPtr path, kj::SourceLocation loc = {}) {
@@ -126,6 +145,25 @@ public:
   void httpGet200(kj::StringPtr path, kj::StringPtr expectedResponse, kj::SourceLocation loc = {}) {
     sendHttpGet(path, loc);
     recvHttp200(expectedResponse, loc);
+  }
+
+  void upgradeToWebSocket() {
+    send(R"(
+      GET / HTTP/1.1
+      Host: somehost
+      Upgrade: websocket
+      Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==
+      Sec-WebSocket-Version: 13
+
+    )"_blockquote);
+
+    recv(R"(
+      HTTP/1.1 101 Switching Protocols
+      Connection: Upgrade
+      Upgrade: websocket
+      Sec-WebSocket-Accept: ICX+Yqv66kxgM0FcWaLWlFLwTAI=
+
+    )"_blockquote);
   }
 
   bool isEof() {
@@ -197,6 +235,74 @@ private:
 
     buffer.add('\0');
     return kj::String(buffer.releaseAsArray());
+  }
+
+  kj::String readWebSocketMessage(size_t maxMessageSize = 1 << 24) {
+    // Reads a single, non-fragmented WebSocket message. Returns just the payload.
+    kj::Vector<uint8_t> header(256);
+    kj::Vector<uint8_t> mask(4);
+
+    KJ_IF_MAYBE(p, premature) {
+      header.add(*p);
+      premature = kj::Maybe<char>();
+    }
+
+    tryRead(header, 2 - header.size(), "reading first two bytes of header");
+    bool masked = header[1] & 0x80;
+    size_t sevenBitPayloadLength = header[1] & 0x7f;
+    size_t realPayloadLength = sevenBitPayloadLength;
+
+    if (sevenBitPayloadLength == 126) {
+      tryRead(header, 2, "reading 16-bit payload length");
+      realPayloadLength = (static_cast<size_t>(header[2]) << 8) + static_cast<size_t>(header[3]);
+    } else if (sevenBitPayloadLength == 127) {
+      tryRead(header, 8, "reading 64-bit payload length");
+      realPayloadLength = (static_cast<size_t>(header[2]) << 56)
+        + (static_cast<size_t>(header[3]) << 48)
+        + (static_cast<size_t>(header[4]) << 40)
+        + (static_cast<size_t>(header[5]) << 32)
+        + (static_cast<size_t>(header[6]) << 24)
+        + (static_cast<size_t>(header[7]) << 16)
+        + (static_cast<size_t>(header[8]) << 8)
+        + (static_cast<size_t>(header[9]));
+
+      if (realPayloadLength > maxMessageSize) {
+        throw KJ_EXCEPTION(FAILED, kj::str("Payload size too big (", realPayloadLength, " > ", maxMessageSize, ")"));
+      }
+    }
+
+    if (masked) {
+      tryRead(mask, 4, "reading mask key");
+      // Currently we assume the mask is always 0, so its application is a no-op, hence we don't
+      // bother.
+    }
+    kj::Vector<char> payload(realPayloadLength + 1);
+
+    tryRead(payload, realPayloadLength, "reading payload");
+    payload.add('\0');
+    return kj::String(payload.releaseAsArray());
+  }
+
+  template <typename T>
+  void tryRead(kj::Vector<T>& buffer, size_t bytesToRead, kj::StringPtr what) {
+    KJ_LOG(INFO, bytesToRead, what);
+    static_assert(sizeof(T) == 1, "not byte-sized");
+
+    size_t pos = buffer.size();
+    size_t bytesRead = 0;
+    buffer.resize(buffer.size() + bytesToRead);
+    while (bytesRead < bytesToRead) {
+      auto promise = stream->tryRead(buffer.begin() + pos, 1, buffer.size() - pos);
+      if (!promise.poll(ws)) {
+        // A tryRead() of 1 byte didn't resolve, there must be no data to read.
+        throw KJ_EXCEPTION(FAILED, kj::str("No data available while ", what));
+      }
+      size_t n = promise.wait(ws);
+      if (n == 0) {
+        throw KJ_EXCEPTION(FAILED, kj::str("Not enough data while ", what));
+      }
+      bytesRead += n;
+    }
   }
 };
 
@@ -493,6 +599,112 @@ KJ_TEST("Server: serve basic Service Worker") {
 
     Bad Request)"_blockquote);
 }
+
+KJ_TEST("Server: serve simple WebSocket echo service") {
+  TestServer test(singleWorker(R"((
+    compatibilityDate = "2022-08-17",
+    modules = [
+      ( name = "main.js",
+        esModule =
+          `export default {
+          `  async fetch(request) {
+          `    const upgradeHeader = request.headers.get('Upgrade');
+          `    if (!upgradeHeader || upgradeHeader !== 'websocket') {
+          `      return new Response('Expected Upgrade: websocket', {status: 400});
+          `    }
+          `    const pair = new WebSocketPair();
+          `    const client = pair[0], server = pair[1];
+          `    server.accept();
+          `    server.addEventListener('message', (event) => {
+          `      server.send(event.data);  // echo it back
+          `    });
+          `    return new Response(null, {status: 101, webSocket: client});
+          `  }
+          `}
+      )
+    ]
+  ))"_kj));
+
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.upgradeToWebSocket();
+  conn.send("\x82\x05hello");
+  conn.recvWebSocket("hello");
+}
+
+KJ_TEST("Server: test WebSocket errors: bad RSV bits") {
+  TestServer test(singleWorker(R"((
+    compatibilityDate = "2022-08-17",
+    modules = [
+      ( name = "main.js",
+        esModule =
+          `var errors = [];
+          `export default {
+          `  async fetch(request) {
+          `    const upgradeHeader = request.headers.get('Upgrade');
+          `    if (!upgradeHeader || upgradeHeader !== 'websocket') {
+          `      console.log("gonna send errors");
+          `      return new Response(JSON.stringify(errors));
+          `    }
+          `    const pair = new WebSocketPair();
+          `    const client = pair[0], server = pair[1];
+          `    server.accept();
+          `    server.addEventListener('message', (event) => {
+          `      if (event.data === "getErrors") {
+          `        server.send(JSON.stringify(errors))
+          `      } else {
+          `        server.send(event.data);  // echo
+          `      }
+          `    });
+          `    server.addEventListener('error', (event) => {
+          `      console.log(event.error);
+          `      errors.push(event);
+          `    });
+          `    return new Response(null, {status: 101, webSocket: client});
+          `  }
+          `}
+      )
+    ]
+  ))"_kj));
+
+  test.start();
+  auto errWsConn = test.connect("test-addr");
+  errWsConn.upgradeToWebSocket();
+
+  auto wsConn = test.connect("test-addr");
+  // wsConn will send some bad WebSocket data.
+  wsConn.upgradeToWebSocket();
+  wsConn.send("\xf1\x08hi there");  // bad frame: all RSV bits set
+  wsConn.recvWebSocketClose(1002);
+
+  // It seems like sending a bad frame on wsConn manages to break all future connections somehow,
+  // maybe?
+  errWsConn.send("\x81\x09getErrors");
+  errWsConn.recvWebSocketRegex(".*RSV bits.*");
+  KJ_LOG(INFO, "done with test, maybe?");
+/*
+  auto errConn = test.connect("test-addr");
+  // errConn will retrieve the error caused by the bad data.
+  KJ_LOG(INFO, "================================= breakage below is mysterious");
+
+  // This works (well, fails correctly) if, instead of sending a bad frame on wsConn, we send a
+  // good one. They're separate connections, though, and I don't understand why goofing up one
+  // breaks the other.
+  //
+  // Things I've tried that haven't helped:
+  //
+  // * instantiating errConn before wsConn
+  //
+  // * sending part of the request before the websocket stuff
+  //
+  // * retrieving the messages via websocket instead
+  //
+  // *
+  errConn.sendHttpGet("/");
+  errConn.recvRegex(".*RSV bits.*");
+*/
+}
+
 
 KJ_TEST("Server: use service name as Service Worker origin") {
   TestServer test(singleWorker(R"((

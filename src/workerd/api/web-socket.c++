@@ -12,6 +12,30 @@
 
 namespace workerd::api {
 
+bool WebSocketProtocolError::decodeFromException(const kj::Exception& ex) {
+  kj::String magic = kj::heapString(magicFileValue);
+
+  auto maybeContext = ex.getContext();
+  while (true) {
+    KJ_IF_MAYBE(context, maybeContext) {
+      if (magic == context->file) {
+        code = context->line;
+        description = kj::heapString(context->description);
+        return true;
+      } else {
+        maybeContext = context->next;
+      }
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
+void WebSocketProtocolError::encodeToException(kj::Exception &ex) && {
+  ex.wrapContext(magicFileValue, code, kj::mv(description));
+}
+
 kj::StringPtr KJ_STRINGIFY(const WebSocket::NativeState& state) {
   // TODO(someday) We might care more about this `OneOf` than its which, that probably means
   // returning a kj::String instead.
@@ -430,7 +454,7 @@ void WebSocket::startReadLoop(jsg::Lock& js) {
 
   // If the kj::WebSocket happens to be an AbortableWebSocket (see util/abortable.h), then
   // calling readLoop here could throw synchronously if the canceler has already been tripped.
-  // Using kj::evalNow() here let's us capture that and handle correctly.
+  // Using kj::evalNow() here lets us capture that and handle correctly.
   //
   // We catch exceptions and return Maybe<Exception> instead since we want to handle the exceptions
   // in awaitIo() below, but we don't want the KJ exception converted to JavaScript before we can
@@ -471,16 +495,25 @@ void WebSocket::startReadLoop(jsg::Lock& js) {
                 (jsg::Lock& js, kj::Maybe<kj::Exception>&& maybeError) mutable {
     auto& native = *farNative;
     KJ_IF_MAYBE(e, maybeError) {
-      if (auto pe = dynamic_cast<WebSocketProtocolException*>(e); pe != nullptr) {
-        //                ^^^^^^^^^^^^ sad trombone noises here
-        // clang says: error: 'kj::Exception' is not polymorphic
+      WebSocketProtocolError wspe;
+      if (wspe.decodeFromException(*e)) {
+        if (!native.closedOutgoing) {
+          // Send a close message to the client if we can.
+          close(js, wspe.getCode(), kj::str(wspe.getDescription()));
+          native.closedOutgoing = true;
+        }
+
+        // Report to the application as an error event.
+        dispatchEventImpl(js, jsg::alloc<ErrorEvent>(
+          kj::str("WebSocket code ", wspe.getCode()),
+          jsg::Value(js.v8Isolate, js.wrapString(wspe.getDescription())), js.v8Isolate));
 
       } else if (!native.closedIncoming && e->getType() == kj::Exception::Type::DISCONNECTED) {
         // Report premature disconnect or cancel as a close event.
         dispatchEventImpl(js, jsg::alloc<CloseEvent>(
             1006, kj::str("WebSocket disconnected without sending Close frame."), false));
         native.closedIncoming = true;
-        // If there are no further messages to send, so we can discard the underlying connection.
+        // If there are no further messages to send, we can discard the underlying connection.
         tryReleaseNative(js);
       } else {
         native.closedIncoming = true;

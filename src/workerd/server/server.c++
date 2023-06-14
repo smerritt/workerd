@@ -2358,8 +2358,13 @@ private:
     // ---------------------------------------------------------------------------
     // implements kj::WebSocketErrorHandler
     kj::Exception handleWebSocketProtocolError(kj::HttpHeaders::ProtocolError protocolError) override {
-      return api::WebSocketProtocolException(protocolError.statusCode,
-        kj::str(protocolError.statusCode, ": ", protocolError.description));
+      kj::Exception ex = KJ_EXCEPTION(FAILED, "worker_do_not_log: WebSocket protocol error");
+      api::WebSocketProtocolError wspe{static_cast<int>(protocolError.statusCode),
+                          kj::heapString(protocolError.description)};
+      // The status codes are all 4-digit decimal numbers, so they'll easily fit in an int.
+      kj::mv(wspe).encodeToException(ex);
+      KJ_LOG(INFO, "handleWebSocketProtocolError", protocolError.statusCode, protocolError.description);
+      return ex;
     }
   };
 };

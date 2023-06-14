@@ -372,7 +372,7 @@ void IoContext::logUncaughtExceptionAsync(UncaughtExceptionSource source,
     // do still want to syslog if relevant, but we can do that without a lock.
     if (!jsg::isTunneledException(exception.getDescription()) &&
         !jsg::isDoNotLogException(exception.getDescription()) &&
-        // TODO(soon): Figure out why client disconncects are getting logged here if we don't
+        // TODO(soon): Figure out why client disconnects are getting logged here if we don't
         // ignore DISCONNECTED. If we fix that, do we still want to filter these?
         exception.getType() != kj::Exception::Type::DISCONNECTED) {
       LOG_EXCEPTION("jsgInternalError", exception);

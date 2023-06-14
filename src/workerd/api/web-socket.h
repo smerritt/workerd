@@ -146,18 +146,31 @@ private:
   void visitForGc(jsg::GcVisitor& visitor);
 };
 
-class WebSocketProtocolException: public kj::Exception {
+class WebSocketProtocolError {
 public:
-  WebSocketProtocolException(int code, kj::String description)
-      : kj::Exception(kj::Exception::Type::FAILED, "not specified", 0, kj::mv(description)),
-        code(code) {}
+  WebSocketProtocolError() = default;
+  WebSocketProtocolError(int code, kj::String description)
+      : code(code), description(kj::mv(description)) {}
 
   int getCode() const { return code; }
+  kj::StringPtr getDescription() const { return description; }
+
+  [[nodiscard]] bool decodeFromException(const kj::Exception& ex);
+  // Fills out this object from the exception's context, but only if the context actually holds
+  // appropriate data. Returns true if successful, false otherwise.
+
+  void encodeToException(kj::Exception& ex) &&;
+  // Adds a context entry to the exception containing this object's data. This is only useful if
+  // you're going to retrieve it with decodeFromException later.
 
 private:
   int code;
+  kj::String description;
+  static inline constexpr char magicFileValue[] = "__WebSocketProtocolError_magicFileValue";
 };
-// Exception thrown for WebSocket protocol errors.
+// Exception-like thing for WebSocket protocol errors. Since kj::WebSocket indicates protocol
+// errors by throwing an exception and since exceptions are caught by kj::Promise, we can't just
+// throw WebSocketProtocolError. Instead, we smuggle the extra in the exception's context.
 
 // The forward declaration is necessary so we can make some
 // WebSocket methods accessible to WebSocketPair via friend declaration.

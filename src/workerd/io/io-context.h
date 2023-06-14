@@ -1347,6 +1347,7 @@ jsg::Promise<IoContext::MaybeIoOwn<addIoOwn, T>> IoContext::awaitIoImpl(
             }
           }
           KJ_CASE_ONEOF(exception, kj::Exception) {
+            KJ_LOG(INFO, exception);
             resolver.reject(lock, kj::mv(exception));
           }
         }
