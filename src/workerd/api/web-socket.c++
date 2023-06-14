@@ -349,7 +349,7 @@ void WebSocket::accept(jsg::Lock& js) {
         "Can't accept() WebSocket after enabling hibernation.");
     // Technically, this means it's okay to invoke `accept()` once a `new WebSocket()` resolves to
     // an established connection. This is probably okay? It might spare the worker devs a class of
-    // errors they do not care care about.
+    // errors they do not care about.
     return;
   }
 
@@ -471,7 +471,11 @@ void WebSocket::startReadLoop(jsg::Lock& js) {
                 (jsg::Lock& js, kj::Maybe<kj::Exception>&& maybeError) mutable {
     auto& native = *farNative;
     KJ_IF_MAYBE(e, maybeError) {
-      if (!native.closedIncoming && e->getType() == kj::Exception::Type::DISCONNECTED) {
+      if (auto pe = dynamic_cast<WebSocketProtocolException*>(e); pe != nullptr) {
+        //                ^^^^^^^^^^^^ sad trombone noises here
+        // clang says: error: 'kj::Exception' is not polymorphic
+
+      } else if (!native.closedIncoming && e->getType() == kj::Exception::Type::DISCONNECTED) {
         // Report premature disconnect or cancel as a close event.
         dispatchEventImpl(js, jsg::alloc<CloseEvent>(
             1006, kj::str("WebSocket disconnected without sending Close frame."), false));

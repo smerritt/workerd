@@ -146,6 +146,19 @@ private:
   void visitForGc(jsg::GcVisitor& visitor);
 };
 
+class WebSocketProtocolException: public kj::Exception {
+public:
+  WebSocketProtocolException(int code, kj::String description)
+      : kj::Exception(kj::Exception::Type::FAILED, "not specified", 0, kj::mv(description)),
+        code(code) {}
+
+  int getCode() const { return code; }
+
+private:
+  int code;
+};
+// Exception thrown for WebSocket protocol errors.
+
 // The forward declaration is necessary so we can make some
 // WebSocket methods accessible to WebSocketPair via friend declaration.
 class WebSocket;

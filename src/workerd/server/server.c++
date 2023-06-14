@@ -20,6 +20,7 @@
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/actor-sqlite.h>
 #include <workerd/api/actor-state.h>
+#include "src/workerd/api/web-socket.h"
 #include "workerd-api.h"
 
 namespace workerd::server {
@@ -2272,11 +2273,12 @@ private:
   kj::StringPtr physicalProtocol;
   kj::Own<HttpRewriter> rewriter;
 
-  struct Connection final: public kj::HttpService, public kj::HttpServerErrorHandler {
+  struct Connection final: public kj::HttpService, public kj::HttpServerErrorHandler, public kj::WebSocketErrorHandler {
     Connection(HttpListener& parent, kj::Maybe<kj::String> cfBlobJson)
         : parent(parent), cfBlobJson(kj::mv(cfBlobJson)),
           listedHttp(parent.owner, parent.timer, parent.headerTable, *this, kj::HttpServerSettings {
             .errorHandler = *this,
+            .webSocketErrorHandler = *this,
             .webSocketCompressionMode = kj::HttpServerSettings::MANUAL_COMPRESSION
           }) {}
 
@@ -2350,6 +2352,14 @@ private:
       } else {
         return kj::READY_NOW;
       }
+    }
+
+
+    // ---------------------------------------------------------------------------
+    // implements kj::WebSocketErrorHandler
+    kj::Exception handleWebSocketProtocolError(kj::HttpHeaders::ProtocolError protocolError) override {
+      return api::WebSocketProtocolException(protocolError.statusCode,
+        kj::str(protocolError.statusCode, ": ", protocolError.description));
     }
   };
 };

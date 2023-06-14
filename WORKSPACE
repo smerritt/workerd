@@ -35,10 +35,10 @@ rules_foreign_cc_dependencies()
 
 http_archive(
     name = "capnp-cpp",
-    sha256 = "dfca9b050b0e3b381c39f44a998cbb6885b36ab650bc041b6ade55b11473e0d4",
-    strip_prefix = "capnproto-capnproto-6e26d26/c++",
+    sha256 = "fcb0abb747d019ce8a93b6a24a6cdae7861a2243589eb489a176941bb4c71ba8",
+    strip_prefix = "smerritt-capnproto-6df71eb/c++",
     type = "tgz",
-    urls = ["https://github.com/capnproto/capnproto/tarball/6e26d260d1d91e0465ca12bbb5230a1dfa28f00d"],
+    urls = ["https://github.com/smerritt/capnproto/tarball/6df71eb9f6f0ed943df6dcb4b659b35ec07cb53e"],
 )
 
 http_archive(
@@ -86,8 +86,8 @@ http_archive(
 
 # tcmalloc requires Abseil.
 #
-# WARNING: This MUST appear before rules_fuzzing_depnedencies(), below. Otherwise,
-#   rules_fuzzing_depnedencies() will choose to pull in a different version of Abseil that is too
+# WARNING: This MUST appear before rules_fuzzing_dependencies(), below. Otherwise,
+#   rules_fuzzing_dependencies() will choose to pull in a different version of Abseil that is too
 #   old for tcmalloc. Absurdly, Bazel simply ignores later attempts to define the same repo name,
 #   rather than erroring out. Thus this leads to confusing compiler errors in tcmalloc complaining
 #   that ABSL_ATTRIBUTE_PURE_FUNCTION is not defined.
