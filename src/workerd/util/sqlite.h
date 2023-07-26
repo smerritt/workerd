@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <kj/debug.h>  // XXX
 #include <kj/filesystem.h>
 #include <kj/one-of.h>
 #include <utility>
@@ -90,8 +92,13 @@ public:
   // any literal values that might contain sensitive information. This is intended to be safe for
   // debug logs.
 
+  int64_t getBytesRead();
+  int64_t getBytesWritten();
+  // Counts bytes read and written to disk by this object.
+
 private:
   sqlite3* db;
+  const Vfs& vfs;
 
   kj::Maybe<Regulator&> currentRegulator;
   // Set while a query is compiling.
@@ -125,6 +132,7 @@ private:
   // Implements SQLite authorizer for 'temp' DB
 
   void setupSecurity();
+  void setupMmap();
 };
 
 class SqliteDatabase::Regulator {
@@ -394,6 +402,12 @@ private:
   const LockManager& lockManager;
   Options options;
 
+  mutable std::atomic<int64_t> bytesRead = 0;
+  mutable std::atomic<int64_t> bytesWritten = 0;
+  // IO byte counters. They're mutable since any IO, whether it affects the state of the VFS or
+  // not, causes their values to change. They're atomic because in KJ, const methods are supposed
+  // to be safe to call from multiple threads simultaneously.
+
   kj::String name = makeName();
   // Value returned by getName();
 
@@ -427,6 +441,18 @@ private:
   //
   // Unfortunately, this requires getting a file path from a kj::Directory. On Windows, we can use
   // the GetFinalPathNameByHandleW() API. On Unix, there's no portable way to do this.
+
+  int64_t getBytesRead() const { return bytesRead.load(); }
+  int64_t getBytesWritten() const { return bytesWritten.load(); }
+  void countBytesRead(int64_t numBytes) const {
+    KJ_DBG("countBytesRead", numBytes);
+    bytesRead += numBytes;
+
+    }
+  void countBytesWritten(int64_t numBytes) const {
+    KJ_DBG("countBytesWritten", numBytes);
+    bytesWritten += numBytes; }
+  // Cumulative IO byte counters. They never reset; they just count up for the life of this object.
 
   friend class SqliteDatabase;
   class DefaultLockManager;

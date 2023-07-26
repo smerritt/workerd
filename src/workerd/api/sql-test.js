@@ -670,6 +670,35 @@ async function test(storage) {
   )
 }
 
+async function testIoStats(storage) {
+  const sql = storage.sql;
+
+  sql.exec(`CREATE TABLE tbl (id INTEGER PRIMARY KEY, value TEXT)`);
+  sql.exec(`INSERT INTO tbl (id, value) VALUES (?, ?)`, 100000, "arbitrary-initial-value");
+  await scheduler.wait(1);
+
+  // When writing, the bytesWritten count goes up.
+  {
+    const startingByteCount = sql.bytesWritten;
+    sql.exec(`INSERT INTO tbl (id, value) VALUES (?, ?)`, 1, "arbitrary-value");
+
+    await scheduler.wait(1);
+    const endingByteCount = sql.bytesWritten;
+    assert.ok(endingByteCount > startingByteCount);
+  }
+
+  // When reading, the bytesRead count goes up.
+  {
+    const startingByteCount = sql.bytesRead;
+    console.log(startingByteCount);
+    const results = Array.from(sql.exec(`SELECT * FROM tbl WHERE id > 0`));
+    assert.ok(results.length > 0);
+    const endingByteCount = sql.bytesRead;
+    console.log(endingByteCount);
+    assert.ok(endingByteCount > startingByteCount);
+  }
+}
+
 async function testForeignKeys(storage) {
   const sql = storage.sql
 
@@ -755,6 +784,15 @@ export class DurableObjectExample {
       this.state.storage.put('counter', val)
       return Response.json(val)
     } else if (req.url.endsWith('/break')) {
+    } else if (req.url.endsWith("/sql-test-io-stats")) {
+      await testIoStats(this.state.storage);
+      return Response.json({ ok: true });
+    } else if (req.url.endsWith("/increment")) {
+      let val = (await this.state.storage.get("counter")) || 0;
+      ++val;
+      this.state.storage.put("counter", val);
+      return Response.json(val);
+    } else if (req.url.endsWith("/break")) {
       // This `put()` should be discarded due to the actor aborting immediately after.
       this.state.storage.put('counter', 888)
 
@@ -782,6 +820,9 @@ export default {
 
     // Test SQL API
     assert.deepEqual(await doReq('sql-test'), { ok: true })
+
+    // Test SQL IO stats
+    assert.deepEqual(await doReq("sql-test-io-stats"), {ok: true});
 
     // Test defer_foreign_keys (explodes the DO)
     await assert.rejects(async () => {

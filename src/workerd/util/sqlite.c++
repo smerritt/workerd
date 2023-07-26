@@ -298,7 +298,7 @@ static constexpr PragmaInfo ALLOWED_PRAGMAS[] = {
 
 SqliteDatabase::Regulator SqliteDatabase::TRUSTED;
 
-SqliteDatabase::SqliteDatabase(const Vfs& vfs, kj::PathPtr path) {
+SqliteDatabase::SqliteDatabase(const Vfs& vfs, kj::PathPtr path) : vfs(vfs) {
   KJ_IF_MAYBE(rootedPath, vfs.tryAppend(path)) {
     // If we can get the path rooted in the VFS's directory, use the system's default VFS instead
     // TODO(bug): This doesn't honor vfs.options. (This branch is only used on Windows.)
@@ -311,10 +311,11 @@ SqliteDatabase::SqliteDatabase(const Vfs& vfs, kj::PathPtr path) {
 
   KJ_ON_SCOPE_FAILURE(sqlite3_close_v2(db));
 
+  setupMmap();
   setupSecurity();
 }
 
-SqliteDatabase::SqliteDatabase(const Vfs& vfs, kj::PathPtr path, kj::WriteMode mode) {
+SqliteDatabase::SqliteDatabase(const Vfs& vfs, kj::PathPtr path, kj::WriteMode mode) : vfs(vfs) {
   int flags = SQLITE_OPEN_READWRITE;
   if (kj::has(mode, kj::WriteMode::CREATE)) {
     flags |= SQLITE_OPEN_CREATE;
@@ -339,6 +340,7 @@ SqliteDatabase::SqliteDatabase(const Vfs& vfs, kj::PathPtr path, kj::WriteMode m
 
   KJ_ON_SCOPE_FAILURE(sqlite3_close_v2(db));
 
+  setupMmap();
   setupSecurity();
 }
 
@@ -354,6 +356,20 @@ SqliteDatabase::~SqliteDatabase() noexcept(false) {
   KJ_REQUIRE(err == SQLITE_OK, sqlite3_errstr(err)) { break; }
 }
 
+void SqliteDatabase::setupMmap() {
+  kj::StringPtr query = "PRAGMA mmap_size=268435456;"_kj;  // 256 MiB. Number chosen for no real reason. :shrug:
+  sqlite3_stmt* stmt = nullptr;
+  int result = sqlite3_prepare_v2(db, query.cStr(), -1 /* read whole string */, &stmt, nullptr);
+  KJ_REQUIRE(result == SQLITE_OK);
+  KJ_DEFER(sqlite3_finalize(stmt));
+
+  do {
+    result = sqlite3_step(stmt);
+  } while (result == SQLITE_ROW);
+
+  KJ_REQUIRE(result == SQLITE_DONE);
+}
+
 void SqliteDatabase::notifyWrite() {
   KJ_IF_MAYBE(cb, onWriteCallback) {
     (*cb)();
@@ -366,6 +382,14 @@ kj::StringPtr SqliteDatabase::getCurrentQueryForDebug() {
   } else {
     return "(no statement is running)";
   }
+}
+
+int64_t SqliteDatabase::getBytesRead() {
+  return vfs.getBytesRead();
+}
+
+int64_t SqliteDatabase::getBytesWritten() {
+  return vfs.getBytesWritten();
 }
 
 kj::Own<sqlite3_stmt> SqliteDatabase::prepareSql(
@@ -995,6 +1019,9 @@ struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
   // It's expected that the wrapped sqlite_file begins in memory immediately after this object.
   sqlite3_file* getWrapped() { return reinterpret_cast<sqlite3_file*>(this + 1); }
 
+  void countBytesRead(int64_t numBytes) const { vfs->countBytesRead(numBytes); }
+  void countBytesWritten(int64_t numBytes) const { vfs->countBytesWritten(numBytes); }
+
   static const sqlite3_io_methods METHOD_TABLE;
 };
 
@@ -1043,8 +1070,30 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
                              &sqlite3_io_methods::name>::wrapper
 
   WRAP(xClose),
-  WRAP(xRead),
-  WRAP(xWrite),
+  .xRead = [](sqlite3_file* file, void* buf, int amount, sqlite3_int64 offset) noexcept -> int {
+    auto wrapper = static_cast<WrappedNativeFileImpl*>(file);
+    file = wrapper->getWrapped();
+    KJ_ASSERT(currentVfsRoot == AT_FDCWD);
+    currentVfsRoot = wrapper->rootFd;
+    KJ_DEFER(currentVfsRoot = AT_FDCWD);
+    int result = (file->pMethods->xRead)(file, buf, amount, offset);
+    if (result > 0) {
+      wrapper->countBytesRead(result);
+    }
+    return result;
+  },
+  .xWrite = [](sqlite3_file* file, const void* buf, int amount, sqlite3_int64 offset) noexcept -> int {
+    auto wrapper = static_cast<WrappedNativeFileImpl*>(file);
+    file = wrapper->getWrapped();
+    KJ_ASSERT(currentVfsRoot == AT_FDCWD);
+    currentVfsRoot = wrapper->rootFd;
+    KJ_DEFER(currentVfsRoot = AT_FDCWD);
+    int result = (file->pMethods->xWrite)(file, buf, amount, offset);
+    if (result == SQLITE_OK) {
+      wrapper->countBytesWritten(amount);
+    }
+    return result;
+  },
   WRAP(xTruncate),
   WRAP(xSync),
   WRAP(xFileSize),
@@ -1068,7 +1117,20 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
   WRAP(xShmBarrier),
   WRAP(xShmUnmap),
 
-  WRAP(xFetch),
+  //WRAP(xFetch),
+  .xFetch = [](sqlite3_file* file, sqlite3_int64 offset, int amount, void** pp) -> int {
+    auto wrapper = static_cast<WrappedNativeFileImpl*>(file);
+    file = wrapper->getWrapped();
+    KJ_ASSERT(currentVfsRoot == AT_FDCWD);
+    currentVfsRoot = wrapper->rootFd;
+    KJ_DEFER(currentVfsRoot = AT_FDCWD);
+    int result = (file->pMethods->xFetch)(file, offset, amount, pp);
+    bool foundAPage = (*pp != nullptr);
+    if (foundAPage) {
+      wrapper->countBytesRead(amount);
+    }
+    return result;
+  },
   WRAP(xUnfetch),
 #undef WRAP
 };
@@ -1245,8 +1307,10 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
 
   .xRead = [](sqlite3_file* file, void* buffer, int iAmt, sqlite3_int64 iOfst) noexcept -> int {
     WRAP_METHOD(SQLITE_IOERR_READ, {
+      KJ_DBG("xRead", iAmt, iOfst);
       auto bytes = kj::arrayPtr(reinterpret_cast<byte*>(buffer), iAmt);
       size_t actual = self.file->read(iOfst, bytes);
+      reinterpret_cast<FileImpl*>(file)->vfs.countBytesRead(actual);
 
       if (actual < iAmt) {
         memset(bytes.begin() + actual, 0, iAmt - actual);
@@ -1262,6 +1326,7 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
     WRAP_METHOD(SQLITE_IOERR_WRITE, {
       auto bytes = kj::arrayPtr(reinterpret_cast<const byte*>(buffer), iAmt);
       KJ_REQUIRE_NONNULL(self.writableFile).write(iOfst, bytes);
+      reinterpret_cast<FileImpl*>(file)->vfs.countBytesWritten(iAmt);
       return SQLITE_OK;
     });
   },
