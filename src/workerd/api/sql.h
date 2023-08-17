@@ -89,12 +89,12 @@ public:
   Cursor(Params&&... params)
       : state(IoContext::current().addObject(kj::heap<State>(kj::fwd<Params>(params)...))),
         ownCachedColumnNames(nullptr),  // silence bogus Clang warning on next line
-        cachedColumnNames(ownCachedColumnNames.emplace()) {}
+        cachedColumnNames(ownCachedColumnNames.emplace()) { KJ_DBG("cursor ctor +"); }
 
   template <typename... Params>
   Cursor(CachedColumnNames& cachedColumnNames, Params&&... params)
       : state(IoContext::current().addObject(kj::heap<State>(kj::fwd<Params>(params)...))),
-        cachedColumnNames(cachedColumnNames) {}
+        cachedColumnNames(cachedColumnNames) { KJ_DBG("cursor ctor2 +"); }
   ~Cursor() noexcept(false);
 
   double getRowsRead();

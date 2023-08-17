@@ -69,6 +69,7 @@ SqlStorage::Cursor::State::State(
 
 SqlStorage::Cursor::~Cursor() noexcept(false) {
   // If this Cursor was created from a Statement, clear the Statement's currentCursor weak ref.
+  KJ_DBG("cursor dtor -");
   KJ_IF_MAYBE(s, selfRef) {
     KJ_IF_MAYBE(p, *s) {
       if (p == this) {
